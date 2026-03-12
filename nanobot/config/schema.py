@@ -48,6 +48,7 @@ class FeishuConfig(Base):
     streaming: bool = True  # Enable streaming output with CardKit (requires cardkit:card:write permission)
     stream_ui: Literal["sections", "plain"] = "sections"  # sections: Reasoning/Tool/Final headers; plain: raw stream only
     react_emoji: str = "THUMBSUP"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
+    group_policy: Literal["open", "mention"] = "mention"  # "mention" responds when @mentioned, "open" responds to all
 
 
 class DingTalkConfig(Base):
