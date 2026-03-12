@@ -3,6 +3,7 @@
 import asyncio
 import json
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,7 +74,6 @@ class LLMProvider(ABC):
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
-
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _TRANSIENT_ERROR_MARKERS = (
         "429",
@@ -142,7 +142,6 @@ class LLMProvider(ABC):
 
             result.append(msg)
         return result
-
     @staticmethod
     def _sanitize_request_messages(
         messages: list[dict[str, Any]],
@@ -156,7 +155,6 @@ class LLMProvider(ABC):
                 clean["content"] = None
             sanitized.append(clean)
         return sanitized
-
     @abstractmethod
     async def chat(
         self,
@@ -258,6 +256,24 @@ class LLMProvider(ABC):
                 content=f"Error calling LLM: {exc}",
                 finish_reason="error",
             )
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+    ) -> AsyncIterator["LLMResponse"]:
+        """
+        Stream a chat completion request.
+
+        Providers that support streaming should override this method.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support streaming")
+        if False:
+            yield LLMResponse(content=None)
 
     @abstractmethod
     def get_default_model(self) -> str:

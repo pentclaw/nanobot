@@ -4,6 +4,8 @@ import html
 import json
 import os
 import re
+import urllib.parse
+from abc import ABC, abstractmethod
 from typing import Any
 from urllib.parse import urlparse
 
@@ -44,59 +46,249 @@ def _validate_url(url: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-class WebSearchTool(Tool):
-    """Search the web using Brave Search API."""
+# =============================================================================
+# Search Engine Backends
+# =============================================================================
 
+class SearchBackend(ABC):
+    """Abstract base class for search engine backends."""
+    
+    @abstractmethod
+    async def search(self, query: str, count: int) -> list[dict]:
+        """Execute search and return list of results with title, url, snippet."""
+        pass
+    
+    @abstractmethod
+    def is_available(self) -> tuple[bool, str]:
+        """Check if the backend is available. Returns (available, error_message)."""
+        pass
+
+
+class TavilyBackend(SearchBackend):
+    """Tavily Search API - optimized for AI/LLM applications."""
+    
+    def __init__(self, api_key: str, proxy: str | None = None):
+        self.api_key = api_key
+        self.proxy = proxy
+    
+    def is_available(self) -> tuple[bool, str]:
+        if not self.api_key:
+            return False, "TAVILY_API_KEY not configured. Get one free at https://tavily.com"
+        return True, ""
+    
+    async def search(self, query: str, count: int) -> list[dict]:
+        async with httpx.AsyncClient(proxy=self.proxy) as client:
+            r = await client.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": self.api_key,
+                    "query": query,
+                    "max_results": count,
+                    "include_answer": False,
+                    "include_raw_content": False,
+                },
+                timeout=15.0
+            )
+            r.raise_for_status()
+        
+        data = r.json()
+        results = []
+        for item in data.get("results", [])[:count]:
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("content", "")
+            })
+        return results
+
+
+class BraveBackend(SearchBackend):
+    """Brave Search API - privacy-focused web search."""
+    
+    def __init__(self, api_key: str, proxy: str | None = None):
+        self.api_key = api_key
+        self.proxy = proxy
+    
+    def is_available(self) -> tuple[bool, str]:
+        if not self.api_key:
+            return False, "BRAVE_API_KEY not configured. Get one at https://brave.com/search/api/"
+        return True, ""
+    
+    async def search(self, query: str, count: int) -> list[dict]:
+        async with httpx.AsyncClient(proxy=self.proxy) as client:
+            r = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": count},
+                headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
+                timeout=10.0
+            )
+            r.raise_for_status()
+        
+        results = []
+        for item in r.json().get("web", {}).get("results", [])[:count]:
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("description", "")
+            })
+        return results
+
+
+class DuckDuckGoBackend(SearchBackend):
+    """DuckDuckGo HTML search - free, no API key required."""
+
+    def __init__(self, proxy: str | None = None):
+        self.proxy = proxy
+    
+    def is_available(self) -> tuple[bool, str]:
+        return True, ""  # Always available, no API key needed
+    
+    async def search(self, query: str, count: int) -> list[dict]:
+        async with httpx.AsyncClient(proxy=self.proxy) as client:
+            r = await client.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
+                timeout=15.0
+            )
+            r.raise_for_status()
+        
+        return self._parse_html(r.text, count)
+    
+    def _parse_html(self, html_content: str, max_results: int) -> list[dict]:
+        """Parse DuckDuckGo HTML search results."""
+        results = []
+        
+        # Pattern to extract title and URL
+        title_pattern = re.compile(
+            r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+            re.DOTALL | re.IGNORECASE
+        )
+        snippet_pattern = re.compile(
+            r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
+            re.DOTALL | re.IGNORECASE
+        )
+        
+        # Split by result divs
+        result_divs = re.split(
+            r'<div[^>]*class="[^"]*result[^"]*results_links[^"]*"',
+            html_content
+        )
+        
+        for div in result_divs[1:max_results + 1]:
+            title_match = title_pattern.search(div)
+            snippet_match = snippet_pattern.search(div)
+            
+            if title_match:
+                url = title_match.group(1)
+                # Extract actual URL from DuckDuckGo redirect
+                if "uddg=" in url:
+                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+                    url = parsed.get("uddg", [url])[0]
+                
+                title = _strip_tags(title_match.group(2))
+                snippet = _strip_tags(snippet_match.group(1)) if snippet_match else ""
+                
+                if title and url:
+                    results.append({"title": title, "url": url, "snippet": snippet})
+            
+            if len(results) >= max_results:
+                break
+        
+        return results
+
+
+# =============================================================================
+# Main WebSearchTool
+# =============================================================================
+
+class WebSearchTool(Tool):
+    """Search the web using configurable search engine backend.
+    
+    Supported engines:
+    - tavily (default): AI-optimized search, requires API key from https://tavily.com
+    - brave: Privacy-focused search, requires API key from https://brave.com/search/api/
+    - duckduckgo: Free search, no API key required
+    """
+    
     name = "web_search"
-    description = "Search the web. Returns titles, URLs, and snippets."
+    description = (
+        "Search the web for current information. Returns titles, URLs, and snippets. "
+        "Use when you need up-to-date facts, documentation, or links (e.g. lookups, troubleshooting)."
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Search query"},
-            "count": {"type": "integer", "description": "Results (1-10)", "minimum": 1, "maximum": 10}
+            "query": {"type": "string", "description": "Search query (e.g. 'python asyncio tutorial', 'current weather API')"},
+            "count": {"type": "integer", "description": "Number of results to return (1-10)", "minimum": 1, "maximum": 10}
         },
         "required": ["query"]
     }
-
-    def __init__(self, api_key: str | None = None, max_results: int = 5, proxy: str | None = None):
-        self._init_api_key = api_key
+    
+    def __init__(
+        self,
+        api_key: str | None = None,
+        max_results: int = 5,
+        engine: str = "tavily",
+        proxy: str | None = None,
+    ):
+        """Initialize WebSearchTool.
+        
+        Args:
+            api_key: API key for Tavily or Brave (not needed for DuckDuckGo)
+            max_results: Default number of results to return
+            engine: Search engine to use ("tavily", "brave", or "duckduckgo")
+        """
         self.max_results = max_results
+        self.engine = engine.lower()
         self.proxy = proxy
-
-    @property
-    def api_key(self) -> str:
-        """Resolve API key at call time so env/config changes are picked up."""
-        return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
-
+        
+        # Resolve API key from parameter or environment
+        if api_key:
+            self.api_key = api_key
+        elif self.engine == "tavily":
+            self.api_key = os.environ.get("TAVILY_API_KEY", "")
+        else:
+            self.api_key = os.environ.get("BRAVE_API_KEY", "")
+        
+        # Initialize the appropriate backend
+        self._backend = self._create_backend()
+    
+    def _create_backend(self) -> SearchBackend:
+        """Create the search backend based on configured engine."""
+        if self.engine == "tavily":
+            return TavilyBackend(self.api_key, proxy=self.proxy)
+        elif self.engine == "brave":
+            return BraveBackend(self.api_key, proxy=self.proxy)
+        elif self.engine == "duckduckgo":
+            return DuckDuckGoBackend(proxy=self.proxy)
+        else:
+            # Default to Tavily for unknown engines
+            return TavilyBackend(self.api_key, proxy=self.proxy)
+    
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if not self.api_key:
-            return (
-                "Error: Brave Search API key not configured. Set it in "
-                "~/.nanobot/config.json under tools.web.search.apiKey "
-                "(or export BRAVE_API_KEY), then restart the gateway."
-            )
-
+        # Check if backend is available
+        available, error_msg = self._backend.is_available()
+        if not available:
+            return f"Error: {error_msg}"
+        
         try:
             n = min(max(count or self.max_results, 1), 10)
-            logger.debug("WebSearch: {}", "proxy enabled" if self.proxy else "direct connection")
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0
-                )
-                r.raise_for_status()
-
-            results = r.json().get("web", {}).get("results", [])[:n]
+            logger.debug(
+                "WebSearch engine={} {}",
+                self.engine,
+                "proxy enabled" if self.proxy else "direct connection",
+            )
+            results = await self._backend.search(query, n)
+            
             if not results:
                 return f"No results for: {query}"
-
+            
             lines = [f"Results for: {query}\n"]
             for i, item in enumerate(results, 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
-                    lines.append(f"   {desc}")
+                lines.append(f"{i}. {item['title']}\n   {item['url']}")
+                if item.get("snippet"):
+                    lines.append(f"   {item['snippet']}")
             return "\n".join(lines)
         except httpx.ProxyError as e:
             logger.error("WebSearch proxy error: {}", e)
@@ -108,33 +300,37 @@ class WebSearchTool(Tool):
 
 class WebFetchTool(Tool):
     """Fetch and extract content from a URL using Readability."""
-
+    
     name = "web_fetch"
-    description = "Fetch URL and extract readable content (HTML → markdown/text)."
+    description = (
+        "Fetch a URL and extract readable content as markdown or plain text. "
+        "Use to read a specific webpage, documentation, or article when the user gives a link or you have a URL from web_search."
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "url": {"type": "string", "description": "URL to fetch"},
+            "url": {"type": "string", "description": "Full URL to fetch (http or https)"},
             "extractMode": {"type": "string", "enum": ["markdown", "text"], "default": "markdown"},
             "maxChars": {"type": "integer", "minimum": 100}
         },
         "required": ["url"]
     }
-
+    
     def __init__(self, max_chars: int = 50000, proxy: str | None = None):
         self.max_chars = max_chars
         self.proxy = proxy
-
+    
     async def execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> str:
         from readability import Document
 
         max_chars = maxChars or self.max_chars
+
+        # Validate URL before fetching
         is_valid, error_msg = _validate_url(url)
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url}, ensure_ascii=False)
 
         try:
-            logger.debug("WebFetch: {}", "proxy enabled" if self.proxy else "direct connection")
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 max_redirects=MAX_REDIRECTS,
@@ -143,11 +339,13 @@ class WebFetchTool(Tool):
             ) as client:
                 r = await client.get(url, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()
-
+            
             ctype = r.headers.get("content-type", "")
-
+            
+            # JSON
             if "application/json" in ctype:
                 text, extractor = json.dumps(r.json(), indent=2, ensure_ascii=False), "json"
+            # HTML
             elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
                 doc = Document(r.text)
                 content = self._to_markdown(doc.summary()) if extractMode == "markdown" else _strip_tags(doc.summary())
@@ -155,10 +353,11 @@ class WebFetchTool(Tool):
                 extractor = "readability"
             else:
                 text, extractor = r.text, "raw"
-
+            
             truncated = len(text) > max_chars
-            if truncated: text = text[:max_chars]
-
+            if truncated:
+                text = text[:max_chars]
+            
             return json.dumps({"url": url, "finalUrl": str(r.url), "status": r.status_code,
                               "extractor": extractor, "truncated": truncated, "length": len(text), "text": text}, ensure_ascii=False)
         except httpx.ProxyError as e:
@@ -167,7 +366,7 @@ class WebFetchTool(Tool):
         except Exception as e:
             logger.error("WebFetch error for {}: {}", url, e)
             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
-
+    
     def _to_markdown(self, html: str) -> str:
         """Convert HTML to markdown."""
         # Convert links, headings, lists before stripping tags

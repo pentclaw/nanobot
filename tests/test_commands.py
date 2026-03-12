@@ -1,11 +1,13 @@
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
 
-from nanobot.cli.commands import app
+from nanobot.agent.skills import SkillsLoader
+from nanobot.cli.commands import _run_direct_with_optional_feishu_stream, app
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
@@ -158,9 +160,173 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
     assert resolved == "github_copilot/gpt-5.3-codex"
 
 
+@pytest.mark.asyncio
+async def test_litellm_stream_preserves_thinking_blocks_for_anthropic_messages() -> None:
+    captured_kwargs: dict = {}
+
+    async def fake_acompletion(**kwargs):
+        captured_kwargs.update(kwargs)
+        if False:  # pragma: no cover
+            yield None
+
+    provider = LiteLLMProvider(default_model="anthropic/claude-sonnet-4-5")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "previous answer",
+            "thinking_blocks": [{"type": "thinking", "thinking": "internal"}],
+        }
+    ]
+
+    with patch("nanobot.providers.litellm_provider.acompletion", side_effect=fake_acompletion):
+        _ = [chunk async for chunk in provider.stream(messages=messages, model="anthropic/claude-sonnet-4-5")]
+
+    sent_message = captured_kwargs["messages"][0]
+    assert "thinking_blocks" in sent_message
+
+
+@pytest.mark.asyncio
+async def test_litellm_stream_strips_thinking_blocks_for_non_anthropic_messages() -> None:
+    captured_kwargs: dict = {}
+
+    async def fake_acompletion(**kwargs):
+        captured_kwargs.update(kwargs)
+        if False:  # pragma: no cover
+            yield None
+
+    provider = LiteLLMProvider(default_model="openai/gpt-4.1")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "previous answer",
+            "thinking_blocks": [{"type": "thinking", "thinking": "internal"}],
+        }
+    ]
+
+    with patch("nanobot.providers.litellm_provider.acompletion", side_effect=fake_acompletion):
+        _ = [chunk async for chunk in provider.stream(messages=messages, model="openai/gpt-4.1")]
+
+    sent_message = captured_kwargs["messages"][0]
+    assert "thinking_blocks" not in sent_message
+
+
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def test_builtin_skills_do_not_include_open_skills(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+
+    repo_root = Path(__file__).resolve().parents[1]
+    builtin_skills_dir = repo_root / "nanobot" / "skills"
+
+    loader = SkillsLoader(workspace=workspace, builtin_skills_dir=builtin_skills_dir)
+    names = {skill["name"] for skill in loader.list_skills(filter_unavailable=False)}
+
+    assert "open-skills" not in names
+
+
+@pytest.mark.asyncio
+async def test_run_direct_uses_feishu_stream_when_available() -> None:
+    stream = SimpleNamespace(
+        stream_callback=lambda chunk: None,
+        close=AsyncMock(),
+    )
+    feishu = SimpleNamespace(open_outbound_stream=AsyncMock(return_value=stream))
+    channels = SimpleNamespace(get_channel=lambda name: feishu if name == "feishu" else None)
+    agent = SimpleNamespace(process_direct=AsyncMock(return_value="ok"))
+
+    response, streamed = await _run_direct_with_optional_feishu_stream(
+        agent=agent,
+        channels=channels,
+        content="hello",
+        session_key="cron:1",
+        channel="feishu",
+        chat_id="oc_test",
+    )
+
+    assert response == "ok"
+    assert streamed is True
+    feishu.open_outbound_stream.assert_awaited_once_with("oc_test")
+    stream.close.assert_awaited_once()
+
+    _, kwargs = agent.process_direct.await_args
+    assert kwargs["stream_callback"] is stream.stream_callback
+    assert kwargs["stream_ui"] == "feishu_chat_sections"
+
+
+@pytest.mark.asyncio
+async def test_run_direct_falls_back_when_feishu_stream_unavailable() -> None:
+    feishu = SimpleNamespace(open_outbound_stream=AsyncMock(return_value=None))
+    channels = SimpleNamespace(get_channel=lambda name: feishu if name == "feishu" else None)
+    agent = SimpleNamespace(process_direct=AsyncMock(return_value="fallback"))
+
+    response, streamed = await _run_direct_with_optional_feishu_stream(
+        agent=agent,
+        channels=channels,
+        content="hello",
+        session_key="cron:2",
+        channel="feishu",
+        chat_id="oc_test",
+    )
+
+    assert response == "fallback"
+    assert streamed is False
+    _, kwargs = agent.process_direct.await_args
+    assert kwargs.get("stream_callback") is None
+    assert kwargs.get("stream_ui") is None
+
+
+@pytest.mark.asyncio
+async def test_run_direct_omits_sections_stream_ui_when_feishu_plain_mode() -> None:
+    stream = SimpleNamespace(
+        stream_callback=lambda chunk: None,
+        close=AsyncMock(),
+    )
+    feishu = SimpleNamespace(
+        open_outbound_stream=AsyncMock(return_value=stream),
+        config=SimpleNamespace(stream_ui="plain"),
+    )
+    channels = SimpleNamespace(get_channel=lambda name: feishu if name == "feishu" else None)
+    agent = SimpleNamespace(process_direct=AsyncMock(return_value="ok"))
+
+    response, streamed = await _run_direct_with_optional_feishu_stream(
+        agent=agent,
+        channels=channels,
+        content="hello",
+        session_key="cron:plain",
+        channel="feishu",
+        chat_id="oc_test",
+    )
+
+    assert response == "ok"
+    assert streamed is True
+    _, kwargs = agent.process_direct.await_args
+    assert kwargs["stream_callback"] is stream.stream_callback
+    assert kwargs.get("stream_ui") is None
+
+
+@pytest.mark.asyncio
+async def test_run_direct_non_feishu_channel_stays_non_streaming() -> None:
+    agent = SimpleNamespace(process_direct=AsyncMock(return_value="ok"))
+
+    response, streamed = await _run_direct_with_optional_feishu_stream(
+        agent=agent,
+        channels=None,
+        content="hello",
+        session_key="cron:3",
+        channel="telegram",
+        chat_id="123",
+    )
+
+    assert response == "ok"
+    assert streamed is False
+    _, kwargs = agent.process_direct.await_args
+    assert kwargs["channel"] == "telegram"
+    assert kwargs["chat_id"] == "123"
+    assert kwargs.get("stream_callback") is None
 
 
 @pytest.fixture

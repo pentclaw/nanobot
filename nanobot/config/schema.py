@@ -45,9 +45,9 @@ class FeishuConfig(Base):
     encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
     verification_token: str = ""  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
-    react_emoji: str = (
-        "THUMBSUP"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
-    )
+    streaming: bool = True  # Enable streaming output with CardKit (requires cardkit:card:write permission)
+    stream_ui: Literal["sections", "plain"] = "sections"  # sections: Reasoning/Tool/Final headers; plain: raw stream only
+    react_emoji: str = "THUMBSUP"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
 
 
 class DingTalkConfig(Base):
@@ -214,7 +214,7 @@ class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
     send_progress: bool = True  # stream agent's text progress to the channel
-    send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+    send_tool_hints: bool = True  # stream tool-call hints / rich-stream tool sections
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -306,7 +306,8 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
-    api_key: str = ""  # Brave Search API key
+    engine: str = "tavily"  # Search engine: "tavily" (default), "brave", or "duckduckgo"
+    api_key: str = ""  # API key for Tavily or Brave Search (not needed for DuckDuckGo)
     max_results: int = 5
 
 

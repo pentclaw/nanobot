@@ -6,6 +6,7 @@ import select
 import signal
 import sys
 from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 # Force UTF-8 encoding for Windows console
 if sys.platform == "win32":
@@ -270,6 +271,71 @@ def _make_provider(config: Config):
     )
     return provider
 
+async def _run_direct_with_optional_feishu_stream(
+    *,
+    agent: Any,
+    channels: Any,
+    content: str,
+    session_key: str,
+    channel: str,
+    chat_id: str,
+    on_progress: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, bool]:
+    """
+    Run an agent turn directly, enabling Feishu rich streaming when available.
+
+    Returns:
+        (response_text, streamed)
+    """
+    if channel != "feishu":
+        response = await agent.process_direct(
+            content,
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            on_progress=on_progress,
+        )
+        return response, False
+
+    feishu_channel = channels.get_channel("feishu") if channels else None
+    open_stream = getattr(feishu_channel, "open_outbound_stream", None)
+    if not callable(open_stream):
+        response = await agent.process_direct(
+            content,
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            on_progress=on_progress,
+        )
+        return response, False
+
+    stream = await open_stream(chat_id)
+    if not stream:
+        response = await agent.process_direct(
+            content,
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            on_progress=on_progress,
+        )
+        return response, False
+
+    try:
+        feishu_stream_mode = getattr(getattr(feishu_channel, "config", None), "stream_ui", "sections")
+        stream_ui = "feishu_chat_sections" if feishu_stream_mode == "sections" else None
+        response = await agent.process_direct(
+            content,
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            on_progress=on_progress,
+            stream_callback=stream.stream_callback,
+            stream_ui=stream_ui,
+        )
+        return response, True
+    finally:
+        await stream.close()
+
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
     """Load config and optionally override the active workspace."""
@@ -348,6 +414,10 @@ def gateway(
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
+        memory_window=config.agents.defaults.memory_window,
+        search_api_key=config.tools.web.search.api_key or None,
+        search_engine=config.tools.web.search.engine,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
@@ -363,11 +433,15 @@ def gateway(
         """Execute a cron job through the agent."""
         from nanobot.agent.tools.cron import CronTool
         from nanobot.agent.tools.message import MessageTool
+
+        target_channel = job.payload.channel or "cli"
+        target_chat_id = job.payload.to or "direct"
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
             f"Task '{job.name}' has been triggered.\n"
             f"Scheduled instruction: {job.payload.message}"
         )
+        streamed = False
 
         # Prevent the agent from scheduling new cron jobs during execution
         cron_tool = agent.tools.get("cron")
@@ -375,12 +449,22 @@ def gateway(
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
         try:
-            response = await agent.process_direct(
-                reminder_note,
-                session_key=f"cron:{job.id}",
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to or "direct",
-            )
+            if job.payload.deliver and job.payload.to:
+                response, streamed = await _run_direct_with_optional_feishu_stream(
+                    agent=agent,
+                    channels=channels,
+                    content=reminder_note,
+                    session_key=f"cron:{job.id}",
+                    channel=target_channel,
+                    chat_id=target_chat_id,
+                )
+            else:
+                response = await agent.process_direct(
+                    reminder_note,
+                    session_key=f"cron:{job.id}",
+                    channel=target_channel,
+                    chat_id=target_chat_id,
+                )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
@@ -389,10 +473,10 @@ def gateway(
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
             return response
 
-        if job.payload.deliver and job.payload.to and response:
+        if job.payload.deliver and job.payload.to and response and not streamed:
             from nanobot.bus.events import OutboundMessage
             await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
+                channel=target_channel,
                 chat_id=job.payload.to,
                 content=response
             ))
@@ -426,19 +510,22 @@ def gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
-        return await agent.process_direct(
-            tasks,
+        response, streamed = await _run_direct_with_optional_feishu_stream(
+            agent=agent,
+            channels=channels,
+            content=tasks,
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
         )
+        return "" if streamed else response
 
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
         from nanobot.bus.events import OutboundMessage
         channel, chat_id = _pick_heartbeat_target()
-        if channel == "cli":
+        if channel == "cli" or not response:
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
@@ -531,6 +618,10 @@ def agent(
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
+        memory_window=config.agents.defaults.memory_window,
+        search_api_key=config.tools.web.search.api_key or None,
+        search_engine=config.tools.web.search.engine,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
@@ -557,11 +648,21 @@ def agent(
         console.print(f"  [dim]↳ {content}[/dim]")
 
     if message:
-        # Single message mode — direct call, no bus needed
+        # Single message mode with streaming
         async def run_once():
+            streamed_content = []
+            def stream_callback(chunk: str) -> None:
+                console.print(chunk, end="")
+                streamed_content.append(chunk)
+
             with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
-            _print_agent_response(response, render_markdown=markdown)
+                response = await agent_loop.process_direct(
+                    message, session_id, on_progress=_cli_progress, stream_callback=stream_callback
+                )
+            if streamed_content:
+                console.print()  # newline after streaming
+            else:
+                _print_agent_response(response, render_markdown=markdown)
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -835,6 +936,51 @@ def status():
             else:
                 has_key = bool(p.api_key)
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+
+
+# ============================================================================
+# Skill Commands
+# ============================================================================
+
+
+skill_app = typer.Typer(help="Manage skills")
+app.add_typer(skill_app, name="skill")
+
+
+@skill_app.command("status")
+def skill_status(
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Show installed skill status."""
+    from nanobot.config.loader import load_config
+    from nanobot.agent.skills import SkillsLoader
+
+    config = load_config()
+    loader = SkillsLoader(config.workspace_path)
+    skills = loader.list_skills_with_status()
+
+    if as_json:
+        console.print_json(data=skills)
+        return
+
+    table = Table(title="Skill Status")
+    table.add_column("Skill", style="cyan")
+    table.add_column("Status")
+    table.add_column("Source", style="yellow")
+    table.add_column("Details")
+
+    for skill in skills:
+        status = skill["status"]
+        if status == "ready":
+            status_text = "[green]ready[/green]"
+        elif status == "warning":
+            status_text = "[yellow]warning[/yellow]"
+        else:
+            status_text = "[red]error[/red]"
+        table.add_row(skill["name"], status_text, skill["source"], skill["details"])
+
+    console.print(table)
+
 
 
 # ============================================================================

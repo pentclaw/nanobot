@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import urljoin
 
@@ -157,6 +158,25 @@ class AzureOpenAIProvider(LLMProvider):
                 content=f"Error calling Azure OpenAI: {repr(e)}",
                 finish_reason="error",
             )
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+    ) -> AsyncIterator[LLMResponse]:
+        """Fallback streaming implementation for providers without native streaming path."""
+        yield await self.chat(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+        )
 
     def _parse_response(self, response: dict[str, Any]) -> LLMResponse:
         """Parse Azure OpenAI response into our standard format."""

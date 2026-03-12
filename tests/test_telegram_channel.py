@@ -291,7 +291,7 @@ async def test_group_policy_mention_accepts_caption_mention() -> None:
     )
 
     assert len(handled) == 1
-    assert handled[0]["content"] == "@nanobot_test photo"
+    assert handled[0]["content"] == "[Alice]: @nanobot_test photo"
 
 
 @pytest.mark.asyncio

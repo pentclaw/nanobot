@@ -11,7 +11,7 @@ from nanobot.agent.tools.base import Tool
 
 class ExecTool(Tool):
     """Tool to execute shell commands."""
-
+    
     def __init__(
         self,
         timeout: int = 60,
@@ -27,7 +27,7 @@ class ExecTool(Tool):
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
             r"\brmdir\s+/s\b",               # rmdir /s
-            r"(?:^|[;&|]\s*)format\b",       # format (as standalone command only)
+            r"(?:^|;|\||&&|\|\||\s&\s)\s*format\b",  # format as a command token, not URL params
             r"\b(mkfs|diskpart)\b",          # disk operations
             r"\bdd\s+if=",                   # dd
             r">\s*/dev/sd",                  # write to disk
@@ -37,7 +37,7 @@ class ExecTool(Tool):
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
-
+    
     @property
     def name(self) -> str:
         return "exec"
@@ -47,7 +47,10 @@ class ExecTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Execute a shell command and return its output. Use with caution."
+        return (
+            "Run a shell/terminal command in the workspace. Use for running scripts, "
+            "installing packages (pip, npm, apt, brew), git, or any CLI tool. Returns stdout/stderr; "
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -56,11 +59,11 @@ class ExecTool(Tool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute",
+                    "description": "The shell command to run (e.g. 'ls -la', 'python script.py')"
                 },
                 "working_dir": {
                     "type": "string",
-                    "description": "Optional working directory for the command",
+                    "description": "Optional working directory; defaults to workspace"
                 },
                 "timeout": {
                     "type": "integer",

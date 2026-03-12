@@ -125,6 +125,41 @@ class TestDispatch:
         await asyncio.gather(t1, t2)
         assert order == ["start-a", "end-a", "start-b", "end-b"]
 
+    @pytest.mark.asyncio
+    async def test_process_direct_is_serialized_with_dispatch(self):
+        from nanobot.bus.events import InboundMessage, OutboundMessage
+
+        loop, _ = _make_loop()
+        order: list[str] = []
+
+        async def mock_process(m, **kwargs):
+            order.append(f"start-{m.content}")
+            await asyncio.sleep(0.05)
+            order.append(f"end-{m.content}")
+            return OutboundMessage(channel="test", chat_id="c1", content=m.content)
+
+        loop._process_message = mock_process
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="from-dispatch")
+
+        t1 = asyncio.create_task(loop._dispatch(msg))
+        await asyncio.sleep(0.01)
+        t2 = asyncio.create_task(
+            loop.process_direct(
+                "from-direct",
+                session_key="cli:direct",
+                channel="cli",
+                chat_id="direct",
+            )
+        )
+
+        await asyncio.gather(t1, t2)
+        assert order == [
+            "start-from-dispatch",
+            "end-from-dispatch",
+            "start-from-direct",
+            "end-from-direct",
+        ]
+
 
 class TestSubagentCancellation:
     @pytest.mark.asyncio

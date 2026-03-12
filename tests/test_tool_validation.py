@@ -3,6 +3,7 @@ from typing import Any
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.web import WebSearchTool
 
 
 class SampleTool(Tool):
@@ -108,6 +109,40 @@ def test_exec_extract_absolute_paths_captures_posix_absolute_paths() -> None:
     assert "/tmp/out.txt" in paths
 
 
+async def test_web_search_execute_does_not_crash_when_backend_available() -> None:
+    class _Backend:
+        def is_available(self) -> tuple[bool, str]:
+            return True, ""
+
+        async def search(self, query: str, count: int) -> list[dict[str, str]]:
+            return [{"title": "A", "url": "https://example.com", "snippet": "B"}]
+
+    tool = WebSearchTool(api_key="x", engine="duckduckgo")
+    tool._backend = _Backend()
+
+    out = await tool.execute("hello", count=1)
+    assert "Results for: hello" in out
+    assert "https://example.com" in out
+
+
+def test_exec_guard_allows_curl_url_query_with_format_param() -> None:
+    tool = ExecTool()
+    err = tool._guard_command('curl -s "https://example.com/api?q=weather&format=json"', cwd=".")
+    assert err is None
+
+
+def test_exec_guard_blocks_rm_force_delete() -> None:
+    tool = ExecTool()
+    err = tool._guard_command("rm -f /tmp/demo.txt", cwd=".")
+    assert err == "Error: Command blocked by safety guard (dangerous pattern detected)"
+
+
+def test_exec_guard_blocks_format_command_token() -> None:
+    tool = ExecTool()
+    err = tool._guard_command("echo ok && format C:", cwd=".")
+    assert err == "Error: Command blocked by safety guard (dangerous pattern detected)"
+
+
 def test_exec_extract_absolute_paths_captures_home_paths() -> None:
     cmd = "cat ~/.nanobot/config.json > ~/out.txt"
     paths = ExecTool._extract_absolute_paths(cmd)
@@ -132,7 +167,6 @@ def test_exec_guard_blocks_quoted_home_path_outside_workspace(tmp_path) -> None:
     tool = ExecTool(restrict_to_workspace=True)
     error = tool._guard_command('cat "~/.nanobot/config.json"', str(tmp_path))
     assert error == "Error: Command blocked by safety guard (path outside working dir)"
-
 
 # --- cast_params tests ---
 

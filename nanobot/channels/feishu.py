@@ -5,15 +5,29 @@ import json
 import os
 import re
 import threading
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.feishu_streaming import (
+    CARDKIT_AVAILABLE,
+    FeishuOutboundStream,
+    FeishuStreamingSession,
+    _normalize_stream_markdown,
+    append_stream_chunk_with_overflow as _append_stream_chunk_with_overflow_impl,
+    close_outbound_stream as _close_outbound_stream_impl,
+    close_stream_best_effort as _close_stream_best_effort_impl,
+    open_outbound_stream as _open_outbound_stream_impl,
+    remove_active_stream_if_current as _remove_active_stream_if_current_impl,
+    stop_stream_worker as _stop_stream_worker_impl,
+    wait_and_close_stream as _wait_and_close_stream_impl,
+)
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import FeishuConfig
 
@@ -28,7 +42,6 @@ MSG_TYPE_MAP = {
     "file": "[file]",
     "sticker": "[sticker]",
 }
-
 
 def _extract_share_card_content(content_json: dict, msg_type: str) -> str:
     """Extract text representation from share cards and interactive messages."""
@@ -72,9 +85,12 @@ def _extract_interactive_content(content: dict) -> list[str]:
         elif isinstance(title, str):
             parts.append(f"title: {title}")
 
-    for elements in content.get("elements", []) if isinstance(content.get("elements"), list) else []:
-        for element in elements:
-            parts.extend(_extract_element_content(element))
+    for element in content.get("elements", []) if isinstance(content.get("elements"), list) else []:
+        if isinstance(element, list):
+            for nested_element in element:
+                parts.extend(_extract_element_content(nested_element))
+            continue
+        parts.extend(_extract_element_content(element))
 
     card = content.get("card", {})
     if card:
@@ -245,6 +261,10 @@ class FeishuChannel(BaseChannel):
 
     name = "feishu"
     display_name = "Feishu"
+    _STREAM_APPEND_TIMEOUT_S = 20.0
+    _STREAM_DRAIN_TIMEOUT_S = 45.0
+    _STREAM_WORKER_STOP_TIMEOUT_S = 10.0
+    _STREAM_CLOSE_TIMEOUT_S = 20.0
 
     def __init__(self, config: FeishuConfig, bus: MessageBus):
         super().__init__(config, bus)
@@ -254,6 +274,7 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._active_streams: dict[str, FeishuStreamingSession] = {}
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -761,7 +782,17 @@ class FeishuChannel(BaseChannel):
             file_path = media_dir / filename
             file_path.write_bytes(data)
             logger.debug("Downloaded {} to {}", msg_type, file_path)
-            return str(file_path), f"[{msg_type}: {filename}]"
+
+            # Extract text from PDF files
+            content_text = f"[{msg_type}: {filename}]"
+            if file_path.suffix.lower() == ".pdf":
+                from nanobot.utils.pdf import extract_pdf_text
+
+                pdf_text = extract_pdf_text(file_path)
+                if pdf_text:
+                    content_text += f"\n\n{pdf_text}"
+
+            return str(file_path), content_text
 
         return None, f"[{msg_type}: download failed]"
 
@@ -800,6 +831,7 @@ class FeishuChannel(BaseChannel):
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
+            session = self._active_streams.get(msg.chat_id)
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
@@ -808,7 +840,15 @@ class FeishuChannel(BaseChannel):
                 ext = os.path.splitext(file_path)[1].lower()
                 if ext in self._IMAGE_EXTS:
                     key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
-                    if key:
+                    if not key:
+                        continue
+                    if session:
+                        await self._append_stream_chunk(
+                            session,
+                            f"\n![image]({key})\n",
+                            source=f"send_media:{msg.metadata.get('message_id', 'none')}",
+                        )
+                    else:
                         await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
@@ -816,39 +856,21 @@ class FeishuChannel(BaseChannel):
                 else:
                     key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
                     if key:
-                        # Use msg_type "media" for audio/video so users can play inline;
-                        # "file" for everything else (documents, archives, etc.)
-                        if ext in self._AUDIO_EXTS or ext in self._VIDEO_EXTS:
-                            media_type = "media"
-                        else:
-                            media_type = "file"
+                        media_type = "audio" if ext in self._AUDIO_EXTS else "file"
                         await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
                         )
 
             if msg.content and msg.content.strip():
-                fmt = self._detect_msg_format(msg.content)
-
-                if fmt == "text":
-                    # Short plain text – send as simple text message
-                    text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
-                    await loop.run_in_executor(
-                        None, self._send_message_sync,
-                        receive_id_type, msg.chat_id, "text", text_body,
+                if session:
+                    await self._append_stream_chunk(
+                        session,
+                        f"\n\n{msg.content}",
+                        source=f"send_text:{msg.metadata.get('message_id', 'none')}",
                     )
-
-                elif fmt == "post":
-                    # Medium content with links – send as rich-text post
-                    post_body = self._markdown_to_post(msg.content)
-                    await loop.run_in_executor(
-                        None, self._send_message_sync,
-                        receive_id_type, msg.chat_id, "post", post_body,
-                    )
-
                 else:
-                    # Complex / long content – send as interactive card
-                    elements = self._build_card_elements(msg.content)
+                    elements = self._build_card_elements(_normalize_stream_markdown(msg.content))
                     for chunk in self._split_elements_by_table_limit(elements):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
                         await loop.run_in_executor(
@@ -949,22 +971,167 @@ class FeishuChannel(BaseChannel):
             if not content and not media_paths:
                 return
 
-            # Forward to message bus
+            # Check permission
+            if not self.is_allowed(sender_id):
+                logger.warning("Access denied for sender {} on channel {}", sender_id, self.name)
+                return
+
             reply_to = chat_id if chat_type == "group" else sender_id
-            await self._handle_message(
-                sender_id=sender_id,
-                chat_id=reply_to,
+            receive_id_type = "chat_id" if reply_to.startswith("oc_") else "open_id"
+            loop = asyncio.get_running_loop()
+
+            # Try to create streaming session
+            stream_id = str(uuid.uuid4())
+            streaming_session: FeishuStreamingSession | None = None
+            use_streaming = False
+            stream_queue: asyncio.Queue[str | None] | None = None
+            stream_worker: asyncio.Task[Any] | None = None
+
+            if self.config.streaming and CARDKIT_AVAILABLE:
+                streaming_session = FeishuStreamingSession(
+                    client=self._client, chat_id=reply_to, receive_id_type=receive_id_type
+                )
+                use_streaming = await loop.run_in_executor(None, streaming_session.start_sync)
+
+            if use_streaming and streaming_session:
+                self._active_streams[reply_to] = streaming_session
+                stream_queue = asyncio.Queue()
+
+                async def _drain_stream_queue() -> None:
+                    while True:
+                        chunk = await stream_queue.get()
+                        try:
+                            if chunk is None:
+                                return
+                            await self._append_stream_chunk(
+                                streaming_session,
+                                chunk,
+                                source=f"inbound_stream:{stream_id}",
+                            )
+                        finally:
+                            stream_queue.task_done()
+
+                stream_worker = asyncio.create_task(_drain_stream_queue())
+
+                def stream_callback(chunk: str) -> None:
+                    try:
+                        text = str(chunk or "")
+                        if text:
+                            stream_queue.put_nowait(text)
+                    except RuntimeError:
+                        pass
+
+                self.bus.register_stream_callback(stream_id, stream_callback)
+
+            # Create and publish inbound message
+            metadata: dict[str, Any] = {
+                "message_id": message_id,
+                "chat_type": chat_type,
+                "msg_type": msg_type,
+            }
+            if use_streaming and self.config.stream_ui == "sections":
+                metadata["_stream_ui"] = "feishu_chat_sections"
+            msg = InboundMessage(
+                channel=self.name,
+                sender_id=str(sender_id),
+                chat_id=str(reply_to),
                 content=content,
                 media=media_paths,
-                metadata={
-                    "message_id": message_id,
-                    "chat_type": chat_type,
-                    "msg_type": msg_type,
-                }
+                metadata=metadata,
+                stream_id=stream_id if use_streaming else None,
             )
+            await self.bus.publish_inbound(msg)
+
+            # Wait for response and close streaming session
+            if use_streaming and streaming_session:
+                await self._wait_and_close_stream(
+                    streaming_session,
+                    stream_id,
+                    stream_queue=stream_queue,
+                    stream_worker=stream_worker,
+                )
+                self._remove_active_stream_if_current(reply_to, streaming_session)
 
         except Exception as e:
             logger.error("Error processing Feishu message: {}", e)
+
+    def _remove_active_stream_if_current(self, chat_id: str, session: FeishuStreamingSession) -> None:
+        """Remove stream mapping only if it still points to this session."""
+        _remove_active_stream_if_current_impl(self._active_streams, chat_id, session)
+
+    async def _append_stream_chunk(
+        self,
+        session: FeishuStreamingSession,
+        chunk: str,
+        *,
+        source: str = "unknown",
+    ) -> None:
+        await _append_stream_chunk_with_overflow_impl(
+            self,
+            session,
+            chunk,
+            source=source,
+            append_timeout_s=self._STREAM_APPEND_TIMEOUT_S,
+        )
+
+    async def _close_stream_best_effort(
+        self,
+        session: FeishuStreamingSession,
+        final_text: str,
+        *,
+        source: str,
+    ) -> None:
+        await _close_stream_best_effort_impl(
+            session,
+            final_text,
+            source=source,
+            close_timeout_s=self._STREAM_CLOSE_TIMEOUT_S,
+        )
+
+    async def _stop_stream_worker(
+        self,
+        *,
+        chat_id: str,
+        stream_queue: asyncio.Queue[str | None],
+        stream_worker: asyncio.Task[Any],
+    ) -> None:
+        await _stop_stream_worker_impl(
+            chat_id=chat_id,
+            stream_queue=stream_queue,
+            stream_worker=stream_worker,
+            drain_timeout_s=self._STREAM_DRAIN_TIMEOUT_S,
+            worker_stop_timeout_s=self._STREAM_WORKER_STOP_TIMEOUT_S,
+        )
+
+    async def open_outbound_stream(self, chat_id: str, title: str | None = None) -> FeishuOutboundStream | None:
+        """Open a proactive streaming card session for outbound jobs (cron/heartbeat)."""
+        return await _open_outbound_stream_impl(
+            self,
+            chat_id,
+            title,
+            cardkit_available=CARDKIT_AVAILABLE,
+            session_cls=FeishuStreamingSession,
+        )
+
+    async def _close_outbound_stream(self, stream: FeishuOutboundStream) -> None:
+        """Drain and close a proactive streaming session."""
+        await _close_outbound_stream_impl(self, stream)
+
+    async def _wait_and_close_stream(
+        self,
+        session: FeishuStreamingSession,
+        stream_id: str,
+        *,
+        stream_queue: asyncio.Queue[str | None] | None = None,
+        stream_worker: asyncio.Task[Any] | None = None,
+    ) -> None:
+        await _wait_and_close_stream_impl(
+            self,
+            session,
+            stream_id,
+            stream_queue=stream_queue,
+            stream_worker=stream_worker,
+        )
 
     def _on_reaction_created(self, data: Any) -> None:
         """Ignore reaction events so they do not generate SDK noise."""

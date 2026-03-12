@@ -28,6 +28,8 @@ class SubagentManager:
         workspace: Path,
         bus: MessageBus,
         model: str | None = None,
+        search_api_key: str | None = None,
+        search_engine: str = "tavily",
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
@@ -38,6 +40,9 @@ class SubagentManager:
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
+        # Keep backward compatibility with legacy brave_api_key wiring.
+        self.search_api_key = search_api_key or brave_api_key
+        self.search_engine = search_engine
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
@@ -101,7 +106,11 @@ class SubagentManager:
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
             ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
+            tools.register(WebSearchTool(
+                api_key=self.search_api_key,
+                engine=self.search_engine,
+                proxy=self.web_proxy,
+            ))
             tools.register(WebFetchTool(proxy=self.web_proxy))
             
             system_prompt = self._build_subagent_prompt()

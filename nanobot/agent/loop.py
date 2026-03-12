@@ -53,6 +53,12 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = 40,
         context_window_tokens: int = 65_536,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        memory_window: int | None = None,
+        search_api_key: str | None = None,
+        search_engine: str = "tavily",
+        reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
@@ -70,6 +76,25 @@ class AgentLoop:
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
+        self.temperature = (
+            temperature
+            if temperature is not None
+            else getattr(provider.generation, "temperature", 0.7)
+        )
+        self.max_tokens = (
+            max_tokens
+            if max_tokens is not None
+            else getattr(provider.generation, "max_tokens", 4096)
+        )
+        self.memory_window = memory_window
+        # Keep backward compatibility with legacy brave_api_key wiring.
+        self.search_api_key = search_api_key or brave_api_key
+        self.search_engine = search_engine
+        self.reasoning_effort = (
+            reasoning_effort
+            if reasoning_effort is not None
+            else getattr(provider.generation, "reasoning_effort", None)
+        )
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
@@ -84,8 +109,10 @@ class AgentLoop:
             workspace=workspace,
             bus=bus,
             model=self.model,
-            brave_api_key=brave_api_key,
-            web_proxy=web_proxy,
+            search_api_key=self.search_api_key,
+            search_engine=self.search_engine,
+            brave_api_key=self.search_api_key,
+            web_proxy=self.web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
@@ -119,7 +146,12 @@ class AgentLoop:
             restrict_to_workspace=self.restrict_to_workspace,
             path_append=self.exec_config.path_append,
         ))
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
+        # Web tools
+        self.tools.register(WebSearchTool(
+            api_key=self.search_api_key,
+            engine=self.search_engine,
+            proxy=self.web_proxy,
+        ))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -163,44 +195,225 @@ class AgentLoop:
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
 
     @staticmethod
+    def _extract_think(text: str | None) -> str | None:
+        """Extract text inside <think>…</think> blocks."""
+        if not text:
+            return None
+        blocks = [b.strip() for b in re.findall(r"<think>([\s\S]*?)</think>", text) if b and b.strip()]
+        if not blocks:
+            return None
+        return "\n".join(blocks)
+
+    @staticmethod
     def _tool_hint(tool_calls: list) -> str:
-        """Format tool calls as concise hint, e.g. 'web_search("query")'."""
-        def _fmt(tc):
-            args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
-            val = next(iter(args.values()), None) if isinstance(args, dict) else None
-            if not isinstance(val, str):
-                return tc.name
-            return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
+        """Format tool calls as concise hint with all arguments, e.g. 'exec(command="ls", working_dir="/tmp")'."""
+        _max_val = 40
+
+        def _fmt_val(val: Any) -> str:
+            if val is None:
+                return "None"
+            s = val if isinstance(val, str) else repr(val)
+            if len(s) > _max_val:
+                return s[:_max_val] + "…"
+            return s
+
+        def _fmt(tc) -> str:
+            args = tc.arguments[0] if isinstance(tc.arguments, list) and tc.arguments else tc.arguments
+            if not args or not isinstance(args, dict):
+                return tc.name + "()"
+            parts = [f'{k}={_fmt_val(v)}' for k, v in args.items()]
+            return f"{tc.name}({', '.join(parts)})"
         return ", ".join(_fmt(tc) for tc in tool_calls)
+
+    @staticmethod
+    def _reasoning_summary(text: str | None, max_len: int = 240) -> str | None:
+        """Return a compact one-line reasoning summary for progress UI."""
+        if not text:
+            return None
+        clean = re.sub(r"\s+", " ", text).strip()
+        # Remove markdown heading markers to avoid accidental heading rendering in stream cards.
+        clean = re.sub(r"(^|\s)#{1,6}\s+", r"\1", clean)
+        if not clean:
+            return None
+        if len(clean) > max_len:
+            clean = clean[:max_len] + "…"
+        return clean
+
+    @staticmethod
+    def _pick_reasoning_for_rich_stream(
+        reasoning_content: str | None,
+        content: str | None,
+        *,
+        has_tool_calls: bool,
+    ) -> tuple[str | None, str]:
+        """Pick best reasoning snippet for rich stream UI and return (summary, source)."""
+        if reasoning_content:
+            summary = AgentLoop._reasoning_summary(reasoning_content)
+            if summary:
+                return summary, "reasoning_content"
+
+        think_text = AgentLoop._extract_think(content)
+        if think_text:
+            summary = AgentLoop._reasoning_summary(think_text)
+            if summary:
+                return summary, "think_tag"
+
+        if has_tool_calls:
+            fallback = AgentLoop._strip_think(content)
+            if fallback:
+                summary = AgentLoop._reasoning_summary(fallback)
+                if summary:
+                    return summary, "content_fallback"
+
+        return None, "none"
+
+    @staticmethod
+    def _tool_result_summary(result: Any, max_len: int = 180) -> str:
+        """Return a compact one-line summary of tool output."""
+        if result is None:
+            return "No output"
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        clean = re.sub(r"\s+", " ", text).strip()
+        if not clean:
+            return "No output"
+        if len(clean) > max_len:
+            clean = clean[:max_len] + "…"
+        return clean
+
+    @staticmethod
+    def _tool_params_summary(arguments: dict[str, Any] | None) -> str:
+        """Return concise key=value pairs for tool arguments."""
+        if not arguments:
+            return "(none)"
+        max_val = 40
+        parts: list[str] = []
+        for k, v in arguments.items():
+            sval = v if isinstance(v, str) else repr(v)
+            if len(sval) > max_val:
+                sval = sval[:max_val] + "…"
+            parts.append(f"{k}={sval}")
+        return ", ".join(parts)
+
+    @staticmethod
+    def _as_text_code_block(text: str) -> str:
+        """Wrap text in a safe markdown text code block."""
+        safe = (text or "").replace("```", "'''")
+        return f"```text\n{safe}\n```"
+
+    @staticmethod
+    def _render_tool_entry(name: str, arguments: dict[str, Any] | None, summary: str) -> str:
+        """Render one tool execution item with separated fields."""
+        params_text = AgentLoop._tool_params_summary(arguments)
+        return (
+            f"🔧 Tool: **{name}**\n"
+            "Params:\n"
+            f"{AgentLoop._as_text_code_block(params_text)}\n"
+            "Summary:\n"
+            f"{AgentLoop._as_text_code_block(summary)}\n\n"
+        )
 
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        stream_callback: Callable[[str], Any] | None = None,
+        stream_ui: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        rich_stream = bool(stream_callback and stream_ui == "feishu_chat_sections")
+        show_tool_details = True
+        if rich_stream and self.channels_config is not None:
+            show_tool_details = bool(self.channels_config.send_tool_hints)
+        analysis_header_sent = False
+        final_header_sent = False
+        missing_reasoning_noted = False
+        section_gap = "\n\n"
+
+        async def _emit(text: str) -> None:
+            if not stream_callback or not text:
+                return
+            res = stream_callback(text)
+            if asyncio.iscoroutine(res):
+                await res
 
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
+            if stream_callback:
+                # Use streaming provider
+                full_content = ""
+                full_reasoning = ""
+                tool_calls: list = []
 
-            response = await self.provider.chat_with_retry(
-                messages=messages,
-                tools=tool_defs,
-                model=self.model,
-            )
+                async for chunk in self.provider.stream(
+                    messages=messages,
+                    tools=tool_defs,
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
+                ):
+                    if chunk.content:
+                        full_content += chunk.content
+                        if not rich_stream:
+                            await _emit(chunk.content)
+                    if chunk.reasoning_content:
+                        full_reasoning += chunk.reasoning_content
+                    if chunk.tool_calls:
+                        tool_calls.extend(chunk.tool_calls)
+
+                from nanobot.providers.base import LLMResponse
+                response = LLMResponse(
+                    content=full_content if full_content else None,
+                    reasoning_content=full_reasoning if full_reasoning else None,
+                    tool_calls=tool_calls,
+                )
+            else:
+                response = await self.provider.chat_with_retry(
+                    messages=messages,
+                    tools=tool_defs,
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
+                )
 
             if response.has_tool_calls:
-                if on_progress:
-                    thought = self._strip_think(response.content)
-                    if thought:
-                        await on_progress(thought)
+                if on_progress and not stream_callback:
+                    thoughts = [
+                        self._strip_think(response.content),
+                        response.reasoning_content,
+                        *(
+                            f"Thinking [{b.get('signature', '...')}]:\n{b.get('thought', '...')}"
+                            for b in (response.thinking_blocks or [])
+                            if isinstance(b, dict) and "signature" in b
+                        ),
+                    ]
+                    combined_thoughts = "\n\n".join(filter(None, thoughts))
+                    if combined_thoughts:
+                        await on_progress(combined_thoughts)
                     await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
+                elif rich_stream:
+                    if not analysis_header_sent:
+                        heading = "🧠 **Reasoning Log & 🔧 Tool Execution**" if show_tool_details else "🧠 **Reasoning Log**"
+                        await _emit(f"{heading}{section_gap}")
+                        analysis_header_sent = True
+                    reasoning, source = self._pick_reasoning_for_rich_stream(
+                        response.reasoning_content,
+                        response.content,
+                        has_tool_calls=True,
+                    )
+                    logger.debug("Rich stream reasoning source (tool round): {}", source)
+                    if reasoning:
+                        await _emit(f"🤔 {reasoning}\n")
+                    elif not missing_reasoning_noted:
+                        await _emit("🤔 No reasoning details were returned by the model.\n")
+                        missing_reasoning_noted = True
 
                 tool_call_dicts = [
                     tc.to_openai_tool_call()
@@ -217,9 +430,17 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    if rich_stream and show_tool_details:
+                        entry = self._render_tool_entry(
+                            tool_call.name,
+                            tool_call.arguments,
+                            self._tool_result_summary(result),
+                        )
+                        await _emit(entry)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
@@ -228,6 +449,24 @@ class AgentLoop:
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
+                if on_progress and clean and not stream_callback:
+                    await on_progress(clean)
+                elif rich_stream:
+                    reasoning, source = self._pick_reasoning_for_rich_stream(
+                        response.reasoning_content,
+                        response.content,
+                        has_tool_calls=False,
+                    )
+                    logger.debug("Rich stream reasoning source (final round): {}", source)
+                    if reasoning:
+                        if not analysis_header_sent:
+                            await _emit(f"🧠 **Reasoning Log**{section_gap}")
+                        await _emit(f"🤔 {reasoning}\n")
+                    if not final_header_sent:
+                        await _emit(f"{section_gap}📌 **Final Output**{section_gap}---{section_gap}")
+                        final_header_sent = True
+                    if clean:
+                        await _emit(clean)
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
@@ -256,10 +495,16 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
 
+            stream_callback = None
+            if msg.stream_id:
+                stream_callback = self.bus.get_stream_callback(msg.stream_id)
+
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
+                if msg.stream_id:
+                    self.bus.mark_stream_done(msg.stream_id)
             else:
-                task = asyncio.create_task(self._dispatch(msg))
+                task = asyncio.create_task(self._dispatch(msg, stream_callback=stream_callback))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
                 task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
@@ -279,11 +524,15 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
 
-    async def _dispatch(self, msg: InboundMessage) -> None:
+    async def _dispatch(
+        self,
+        msg: InboundMessage,
+        stream_callback: Callable[[str], Any] | None = None,
+    ) -> None:
         """Process a message under the global lock."""
         async with self._processing_lock:
             try:
-                response = await self._process_message(msg)
+                response = await self._process_message(msg, stream_callback=stream_callback)
                 if response is not None:
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
@@ -300,6 +549,9 @@ class AgentLoop:
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Sorry, I encountered an error.",
                 ))
+            finally:
+                if msg.stream_id:
+                    self.bus.mark_stream_done(msg.stream_id)
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
@@ -320,6 +572,7 @@ class AgentLoop:
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        stream_callback: Callable[[str], Any] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -370,6 +623,8 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            # Session key was explicitly reset; drop its lock mapping to avoid stale retention.
+            self._consolidation_locks.pop(session.key, None)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -400,7 +655,10 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            stream_callback=stream_callback,
+            stream_ui=(msg.metadata or {}).get("_stream_ui"),
         )
 
         if final_content is None:
@@ -409,6 +667,14 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+
+        # Mark stream as done so channel can close streaming session
+        if msg.stream_id:
+            self.bus.mark_stream_done(msg.stream_id)
+
+        # If streaming was used, content was already delivered via callback
+        if stream_callback:
+            return None
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -462,9 +728,25 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        stream_callback: Callable[[str], Any] | None = None,
+        stream_ui: str | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        metadata: dict[str, Any] = {}
+        if stream_ui:
+            metadata["_stream_ui"] = stream_ui
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata,
+        )
+        # Keep direct invocations (cron/heartbeat/CLI) serialized with channel-driven
+        # dispatches to avoid shared per-turn tool state races.
+        async with self._processing_lock:
+            response = await self._process_message(
+                msg, session_key=session_key, on_progress=on_progress, stream_callback=stream_callback
+            )
         return response.content if response else ""

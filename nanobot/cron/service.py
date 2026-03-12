@@ -75,15 +75,16 @@ class CronService:
         self._timer_task: asyncio.Task | None = None
         self._running = False
 
-    def _load_store(self) -> CronStore:
+    def _load_store(self, force: bool = False) -> CronStore:
         """Load jobs from disk. Reloads automatically if file was modified externally."""
-        if self._store and self.store_path.exists():
-            mtime = self.store_path.stat().st_mtime
-            if mtime != self._last_mtime:
-                logger.info("Cron: jobs.json modified externally, reloading")
-                self._store = None
-        if self._store:
-            return self._store
+        if self._store and not force:
+            if self.store_path.exists():
+                mtime = self.store_path.stat().st_mtime
+                if mtime != self._last_mtime:
+                    logger.info("Cron: jobs.json modified externally, reloading")
+                    self._store = None
+            if self._store:
+                return self._store
 
         if self.store_path.exists():
             try:
@@ -119,6 +120,7 @@ class CronService:
                         delete_after_run=j.get("deleteAfterRun", False),
                     ))
                 self._store = CronStore(jobs=jobs)
+                self._last_mtime = self.store_path.stat().st_mtime
             except Exception as e:
                 logger.warning("Failed to load cron store: {}", e)
                 self._store = CronStore()
@@ -204,17 +206,27 @@ class CronService:
         times = [j.state.next_run_at_ms for j in self._store.jobs
                  if j.enabled and j.state.next_run_at_ms]
         return min(times) if times else None
+    
+    MIN_CHECK_INTERVAL_MS = 60 * 1000  # 1 minute
 
     def _arm_timer(self) -> None:
         """Schedule the next timer tick."""
         if self._timer_task:
             self._timer_task.cancel()
 
-        next_wake = self._get_next_wake_ms()
-        if not next_wake or not self._running:
+        if not self._running:
             return
 
-        delay_ms = max(0, next_wake - _now_ms())
+        next_wake = self._get_next_wake_ms()
+
+        if next_wake:
+            delay_ms = max(0, next_wake - _now_ms())
+            # Check file changes at least every minute
+            if delay_ms > self.MIN_CHECK_INTERVAL_MS:
+                delay_ms = self.MIN_CHECK_INTERVAL_MS
+        else:
+            # No jobs: periodic check for external file changes
+            delay_ms = self.MIN_CHECK_INTERVAL_MS
         delay_s = delay_ms / 1000
 
         async def tick():
@@ -224,10 +236,26 @@ class CronService:
 
         self._timer_task = asyncio.create_task(tick())
 
+    def _check_file_changed(self) -> bool:
+        """Check if store file was modified externally."""
+        if not self.store_path.exists():
+            return False
+
+        current_mtime = self.store_path.stat().st_mtime
+        return current_mtime != self._last_mtime
+
     async def _on_timer(self) -> None:
-        """Handle timer tick - run due jobs."""
-        self._load_store()
+        """Handle timer tick - run due jobs and check for external changes."""
+        file_changed = self._check_file_changed()
+        if file_changed:
+            logger.info("Cron: external changes detected, reloading store")
+            self._load_store(force=True)
+            self._recompute_next_runs()
+        else:
+            self._load_store()
+
         if not self._store:
+            self._arm_timer()
             return
 
         now = _now_ms()
@@ -239,7 +267,10 @@ class CronService:
         for job in due_jobs:
             await self._execute_job(job)
 
-        self._save_store()
+        # Only save if file was modified externally or jobs were executed
+        if file_changed or due_jobs:
+            self._save_store()
+            logger.debug("Cron: store saved")
         self._arm_timer()
 
     async def _execute_job(self, job: CronJob) -> None:
